@@ -1,0 +1,8 @@
+langchain
+langgraph
+langchain-groq
+langchain-core
+sqlalchemy
+streamlit
+pandas
+openpyxl
