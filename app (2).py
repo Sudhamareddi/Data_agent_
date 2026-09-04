@@ -4,19 +4,21 @@ every response shows the agent's exploration steps, generated SQL, and
 raw underlying data, not just the final answer.
 
 Three data source modes, all running through the exact same agent code:
-  - "Payments / fintech demo" -- 11-table SQLite payments/ops schema.
-  - "E-commerce example" -- 11-table SQLite e-commerce schema.
-  - "Upload your own Excel file" -- any .xlsx/.xls, one table per sheet.
+  - "Payments / fintech demo"     -- 11-table SQLite payments/ops schema.
+  - "E-commerce example"          -- 11-table SQLite e-commerce schema.
+  - "Upload your own Excel file"  -- any .xlsx/.xls, one table per sheet.
 
 For every mode, the sidebar shows a schema preview (tables, columns,
 row counts) before you ask anything -- so you can see what the agent
 will be exploring, same as the uploaded-file summary.
 
 Run: streamlit run app.py
+
 Requires GROQ_API_KEY set in Streamlit Cloud's Secrets (Settings ->
 Secrets) when deployed, or as a local environment variable when
 running on your own machine. It is never entered or shown in the UI.
 """
+
 import os
 import streamlit as st
 from sqlalchemy import inspect, text
@@ -26,10 +28,9 @@ from db_setup import get_example_engine
 from fintech_db_setup import get_fintech_engine
 from excel_loader import build_engine_from_excel
 from tools import make_tools
-from agent_graph import build_agent
+from agent_graph import build_agent, SUPPORTED_MODELS, DEFAULT_MODEL
 
 st.set_page_config(page_title="AI Data Analytics Agent (LangGraph)", layout="wide")
-
 st.title("AI Data Analytics Agent — LangGraph Edition")
 st.caption(
     "An agent that investigates payments/ops questions — failed transactions, "
@@ -76,16 +77,15 @@ source_mode = st.sidebar.radio(
 if source_mode == "Payments / fintech demo":
     engine = get_fintech_engine()
     show_schema_preview(describe_engine(engine), "Payments / fintech demo")
-
 elif source_mode == "E-commerce example":
     engine = get_example_engine()
     show_schema_preview(describe_engine(engine), "E-commerce example")
-
 else:
     uploaded = st.sidebar.file_uploader("Upload .xlsx / .xls", type=["xlsx", "xls"])
     if uploaded is None:
         st.info("Upload an Excel file in the sidebar to begin, or switch back to an example database.")
         st.stop()
+
     if st.session_state.get("_uploaded_name") != uploaded.name:
         with st.spinner("Reading workbook and building schema..."):
             engine, uploaded_summary = build_engine_from_excel(uploaded)
@@ -95,17 +95,23 @@ else:
         # New file -> reset conversation, old schema no longer applies.
         st.session_state["state"] = {"messages": [], "tool_call_log": [], "schema_cache": {}, "verify_attempts": 0}
         st.session_state["history"] = []
+
     engine = st.session_state["_engine"]
     show_schema_preview(st.session_state.get("_uploaded_summary", []), "Uploaded file")
 
 # ---------------- Sidebar: model (no key input -- pulled from secrets) ----------------
-model_name = st.sidebar.selectbox(
-    "Model", ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+# Only currently-supported Groq models are offered. llama-3.3-70b-versatile
+# was deprecated by Groq on 2026-06-17 and fully decommissioned on
+# 2026-08-16 -- it is no longer served, so it has been removed from this
+# list rather than left in as a silent trap. See agent_graph.SUPPORTED_MODELS.
+model_name = st.sidebar.selectbox("Model", SUPPORTED_MODELS, index=SUPPORTED_MODELS.index(DEFAULT_MODEL))
+st.sidebar.caption(
+    "Only currently-supported Groq models are listed. If a model is "
+    "deprecated in the future, remove it from `SUPPORTED_MODELS` in "
+    "agent_graph.py rather than leaving it selectable."
 )
 
-# Pull the key from Streamlit secrets (set in Settings -> Secrets when
-# deployed) or a local env var when running on your own machine/Colab.
-# Never shown or entered in the UI.
+
 def _get_api_key() -> str:
     try:
         if "GROQ_API_KEY" in st.secrets:
@@ -147,12 +153,56 @@ if prompt:
     st.session_state.history.append({"role": "user", "content": prompt})
 
     tools = make_tools(engine)
-    agent = build_agent(tools, model_name=model_name, api_key=api_key)
+
     st.session_state.state["messages"] = list(st.session_state.state["messages"]) + [HumanMessage(content=prompt)]
     st.session_state.state["verify_attempts"] = 0
 
+    # --- Error handling: a bad/deprecated/rate-limited model call must
+    # never crash the whole app. Try the selected model; on failure, fall
+    # back once to DEFAULT_MODEL and tell the user what happened instead
+    # of showing a raw traceback. ---
+    result_state = None
+    error_message = None
+    used_model = model_name
+
     with st.spinner("Exploring schema and reasoning..."):
-        result_state = agent.invoke(st.session_state.state)
+        try:
+            agent = build_agent(tools, model_name=model_name, api_key=api_key)
+            result_state = agent.invoke(st.session_state.state)
+        except Exception as e:
+            first_error = str(e)
+            if model_name != DEFAULT_MODEL:
+                # Retry once with the known-good default before giving up.
+                try:
+                    agent = build_agent(tools, model_name=DEFAULT_MODEL, api_key=api_key)
+                    result_state = agent.invoke(st.session_state.state)
+                    used_model = DEFAULT_MODEL
+                    error_message = (
+                        f"'{model_name}' failed ({first_error[:200]}). "
+                        f"Fell back to '{DEFAULT_MODEL}' for this response."
+                    )
+                except Exception as e2:
+                    error_message = f"Both '{model_name}' and the fallback '{DEFAULT_MODEL}' failed: {str(e2)[:300]}"
+            else:
+                error_message = f"The model call failed: {first_error[:300]}"
+
+    if result_state is None:
+        with st.chat_message("assistant"):
+            st.error(
+                "Sorry — I couldn't get a response from the model. "
+                f"{error_message}\n\nThis is usually a temporary API issue, an "
+                "invalid/expired key, or a deprecated model name. Try again, "
+                "or pick a different model from the sidebar."
+            )
+        st.session_state.history.append({
+            "role": "assistant",
+            "content": f"[Error] {error_message}",
+            "trace": "",
+        })
+        st.stop()
+
+    if error_message:
+        st.sidebar.warning(error_message)
 
     st.session_state.state = result_state
 
@@ -165,6 +215,8 @@ if prompt:
             final_answer = m.content
 
     with st.chat_message("assistant"):
+        if used_model != model_name:
+            st.caption(f"(Answered using {used_model} after {model_name} failed.)")
         st.write(final_answer)
         with st.expander("Exploration steps, SQL, and raw data"):
             st.code("\n".join(trace_lines), language="json")
