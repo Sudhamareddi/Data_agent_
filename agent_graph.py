@@ -5,21 +5,27 @@ This replaces the original custom Groq tool-calling loop with a proper
 LangGraph StateGraph, while preserving the same reliability guarantees
 the original project had:
 
-  1. Repeat-call detection   -> tool_node() checks a call-signature log
-                                 before executing, so the agent can't
-                                 loop on an identical call.
-  2. Malformed-response filtering -> tools.py rejects bad SQL / unknown
-                                 table names before they hit the DB;
-                                 tool_node() also guards against
-                                 malformed tool-call args from the LLM.
-  3. Grounded-answer verification -> verify_node() checks that the
-                                 final answer's key facts actually
-                                 appear in tool output before letting
-                                 the graph terminate.
+1. Repeat-call detection      -> tool_node() checks a call-signature log
+                                  before executing, so the agent can't
+                                  loop on an identical call.
+2. Malformed-response filtering -> tools.py rejects bad SQL / unknown
+                                  table names before they hit the DB;
+                                  tool_node() also guards against
+                                  malformed tool-call args from the LLM.
+3. Grounded-answer verification -> verify_node() checks that the
+                                  final answer's key facts actually
+                                  appear in tool output before letting
+                                  the graph terminate.
 
 Swap `sample.db` in tools.py for a real connection string to point
 this at production data -- the graph and safeguards don't change.
+
+NOTE (Sep 2026): Groq deprecated llama-3.3-70b-versatile on
+2026-06-17 and fully decommissioned it on 2026-08-16. It is no longer
+served. The default model here is openai/gpt-oss-120b, Groq's
+recommended replacement. See https://console.groq.com/docs/deprecations
 """
+
 import os
 import json
 from typing import TypedDict, Annotated, Sequence
@@ -41,16 +47,23 @@ plain language, citing the specific numbers/rows you retrieved."""
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    tool_call_log: list          # signatures of tool calls already made
-    schema_cache: dict           # table_name -> schema JSON, reused across turns
-    verify_attempts: int         # guards the grounded-answer retry loop
+    tool_call_log: list      # signatures of tool calls already made
+    schema_cache: dict       # table_name -> schema JSON, reused across turns
+    verify_attempts: int     # guards the grounded-answer retry loop
 
 
 def _signature(name: str, args: dict) -> str:
     return f"{name}:{json.dumps(args, sort_keys=True)}"
 
 
-def build_agent(tools: list, model_name: str = "llama-3.3-70b-versatile", api_key: str | None = None):
+# Groq's currently-supported models as of Sep 2026. Kept as a single
+# source of truth so app.py's dropdown and this default never drift
+# apart again -- import DEFAULT_MODEL / SUPPORTED_MODELS from here.
+SUPPORTED_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+DEFAULT_MODEL = "openai/gpt-oss-120b"
+
+
+def build_agent(tools: list, model_name: str = DEFAULT_MODEL, api_key: str | None = None):
     """
     tools: the list returned by tools.make_tools(engine) -- bound to
     whichever database is active (example DB or an uploaded Excel file).
@@ -125,9 +138,9 @@ def build_agent(tools: list, model_name: str = "llama-3.3-70b-versatile", api_ke
         tool_outputs = " ".join(
             m.content for m in state["messages"] if isinstance(m, ToolMessage)
         )
-
         numbers_in_answer = set(re_findall_numbers(final))
         numbers_in_evidence = set(re_findall_numbers(tool_outputs))
+
         grounded = bool(tool_outputs) and (
             not numbers_in_answer or numbers_in_answer & numbers_in_evidence
         )
@@ -153,7 +166,6 @@ def build_agent(tools: list, model_name: str = "llama-3.3-70b-versatile", api_ke
     graph.add_node("agent", call_model)
     graph.add_node("tools", tool_node)
     graph.add_node("verify", verify_node)
-
     graph.set_entry_point("agent")
     graph.add_conditional_edges("agent", route_after_model, {"tools": "tools", "verify": "verify"})
     graph.add_edge("tools", "agent")
